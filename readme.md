@@ -3,7 +3,7 @@
 my implement for Lab
 
 ## todoLab
-- [ ] Lab1(working on)
+- [X] Lab1(All test passed)
 - [ ] Lab2
 - [ ] Lab3
 - [ ] Lab4

@@ -6,7 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 import "strconv"
 
 //
@@ -24,6 +27,35 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+const (
+	//_timeout = -1 worker timeout
+	_map    = 0
+	_reduce = 1
+	_wait   = 2
+	_end    = 3
+	_failed = 4
+)
+
+// master 和 worker之间,是通过rpc进行通信的
+type TaskState struct {
+	/*
+		Declared in consts above
+			0  map
+			1  reduce
+			2  wait
+			3  end
+	*/
+	State       int
+	MapIndex    int
+	ReduceIndex int
+	FileName    string
+	R           int
+	M           int
+}
+
+func (ts *TaskState) Log(prefix string) {
+	fmt.Printf("%s taskState: %+v\n", prefix, ts)
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

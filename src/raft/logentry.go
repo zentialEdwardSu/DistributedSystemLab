@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -13,31 +14,38 @@ type LogEntry struct {
 	Command interface{} // generic Command to hold log command
 }
 
-// inspired by https://github.com/hashicorp/raft/blob/main/inmem_store.go
-// I chose map instead of slice to hold log data to gain o(1) Logsearching and LogInserting
+func (l *LogEntry) String() string {
+	return fmt.Sprintf("{term:%d,index:%d,Command:%v}", l.Term, l.Index, l.Command)
+}
+
+// LogStore inspired by https://github.com/hashicorp/raft/blob/main/inmem_store.go
+// we chose map instead of slice to hold log data to gain o(1) LogSearching and LogInserting
 type LogStore struct {
-	lock      sync.RWMutex
+	l         sync.RWMutex
 	logs      map[int]*LogEntry // logEntries
 	lowIndex  int
 	highIndex int
 }
 
+func (ls *LogStore) String() string {
+	return fmt.Sprintf("{highIndex:%d,lowIndex:%d,logs:%v}", ls.highIndex, ls.lowIndex, ls.logs)
+}
+
 func (ls *LogStore) getLog(idx int, l *LogEntry) error {
-	ls.lock.RLock()
-	defer ls.lock.RUnlock()
+	ls.l.RLock()
+	defer ls.l.RUnlock()
 
 	log, ok := ls.logs[idx]
 	if !ok {
 		return ErrLogNotFound
 	}
-
 	*l = *log
 	return nil
 }
 
 func (ls *LogStore) setLogs(logs []*LogEntry) error {
-	ls.lock.Lock()
-	defer ls.lock.Unlock()
+	ls.l.Lock()
+	defer ls.l.Unlock()
 
 	for _, l := range logs {
 		ls.logs[l.Index] = l
@@ -50,6 +58,8 @@ func (ls *LogStore) setLogs(logs []*LogEntry) error {
 		}
 	}
 
+	//DPrintf("LogStore:%v", ls.logs)
+
 	return nil
 }
 
@@ -57,17 +67,15 @@ func (ls *LogStore) setLog(log *LogEntry) error {
 	return ls.setLogs([]*LogEntry{log})
 }
 
-func (ls *LogStore) newLogStore() *LogStore {
-	i := &LogStore{
-		logs: make(map[int]*LogEntry),
-	}
-
-	return i
+func newLogStore() *LogStore {
+	l := new(LogStore)
+	l.logs = make(map[int]*LogEntry)
+	return l
 }
 
 func (ls *LogStore) DeleteRange(min, max int) error {
-	ls.lock.Lock()
-	defer ls.lock.Unlock()
+	ls.l.Lock()
+	defer ls.l.Unlock()
 	for j := min; j <= max; j++ {
 		delete(ls.logs, j)
 	}
@@ -82,4 +90,16 @@ func (ls *LogStore) DeleteRange(min, max int) error {
 		ls.highIndex = 0
 	}
 	return nil
+}
+
+func (ls *LogStore) FirstIndex() (int, error) {
+	ls.l.RLock()
+	defer ls.l.RUnlock()
+	return ls.lowIndex, nil
+}
+
+func (ls *LogStore) LastIndex() (int, error) {
+	ls.l.RLock()
+	defer ls.l.RUnlock()
+	return ls.highIndex, nil
 }

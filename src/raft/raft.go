@@ -54,10 +54,15 @@ func (r State) String() string {
 }
 
 const (
-	ElectionTimeout  = 250 * time.Millisecond // limit of Timeout for election and re-election
-	HeartBeatTimeout = 100 * time.Millisecond // time limited 10 AppendEntries per second
-	TimeoutOffset    = 20 * time.Millisecond  // Offset to fix issue may cause by the less Heartbeat
-	RPCTimeout       = 100 * time.Millisecond // timeout for an RPC call
+	ElectionTimeout = 200 * time.Millisecond // limit of Timeout for election and re-election
+
+	HeartBeatTimeout = 300 * time.Millisecond // Timeout when Follower didn't contact with a Leader
+
+	// CommitTimeout for we spilt heartbeat and logReplication we need a timeout to trigger LogReplication
+	// when no Start() called
+	CommitTimeout = 150 * time.Millisecond
+
+	RPCTimeout = 100 * time.Millisecond // timeout for an RPC call
 )
 
 const (
@@ -117,6 +122,7 @@ type Raft struct {
 	nextIndexes      []int         // next index Leader will send to each follower
 	matchIndexes     []int         // index of highest log entry known to be replicated
 	leaderStepDownCh chan struct{} // notify leader to step down
+	logTriggerCh     chan struct{} // notify leader to start replication when Start() are called
 
 	applyCh chan ApplyMsg // use to submit newly committed log to tester
 	//2C
@@ -135,7 +141,7 @@ type Raft struct {
 }
 
 func (rf *Raft) String() string {
-	lastIndex, _ := rf.LastEntry()
+	lastIndex, _ := rf.getLastEntry()
 	return fmt.Sprintf("Raft[%d] Term: %d role: %s lastIndex:%d commitIndex:%d logs:%v",
 		rf.me, rf.getCurrentTerm(), rf.getRaftState(), lastIndex, rf.getCommitIndex(), rf.logEntries)
 }
@@ -243,8 +249,8 @@ func (rf *Raft) LastIndex() int {
 	return max(rf.lastLogIndex, rf.lastSnapshotIndex)
 }
 
-// LastEntry return the last log's index and term
-func (rf *Raft) LastEntry() (index, term int) {
+// getLastEntry return the last log's index and term
+func (rf *Raft) getLastEntry() (index, term int) {
 	rf.lastLock.Lock()
 	defer rf.lastLock.Unlock()
 	index = rf.lastSnapshotIndex
@@ -264,6 +270,8 @@ func (rf *Raft) InitLeaderState() {
 	defer rf.LeaderLock.Unlock()
 	rf.matchIndexes = make([]int, len(rf.peers))
 	rf.nextIndexes = make([]int, len(rf.peers))
+	rf.logTriggerCh = make(chan struct{}, 1)
+	rf.leaderStepDownCh = make(chan struct{}, 1)
 
 	serverCount := len(rf.peers)
 	lastLogIndex, _ := rf.logEntries.LastIndex()
@@ -339,7 +347,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//DPrintf("[term %d]: Raft[%d] receive requestVote from Raft[%d]", rf.getCurrentTerm(), rf.me, args.CandidateId)
 
-	lastlogIndex, lastlogTerm := rf.LastEntry()
+	lastlogIndex, lastlogTerm := rf.getLastEntry()
 
 	reply.Term = rf.getCurrentTerm()
 	reply.VoteGranted = false
@@ -410,17 +418,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-//	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-//	return ok
-//}
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
 
 // electSelf will vote for self and send Vote Request to other Nodes
 // it will return a channel which collect RequestVoteReply
 func (rf *Raft) electSelf() <-chan *RequestVoteReply {
 	rf.setVotedFor(rf.me)                                   // vote for self
 	voteChan := make(chan *RequestVoteReply, len(rf.peers)) // create vote collecting chan
-	voteReq := RequestVoteArgsFromRaft(rf)
+	lastLogIndex, lastLogTerm := rf.getLastEntry()
+	voteRequest := &RequestVoteArgs{
+		Term:         rf.getCurrentTerm(),
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
 	for idx, _ := range rf.peers {
 		if idx == rf.me {
 			continue
@@ -428,8 +442,8 @@ func (rf *Raft) electSelf() <-chan *RequestVoteReply {
 
 		go func(pidx int) {
 			voteReply := new(RequestVoteReply)
-			s := rf.peers[pidx].Call("Raft.RequestVote", &voteReq, voteReply)
-			if !s {
+			ok := rf.sendRequestVote(pidx, voteRequest, voteReply)
+			if !ok {
 				DPrintf("[term %d]: Raft[%d] failed to requestVote from Raft[%d]", rf.getCurrentTerm(), rf.me, pidx)
 			}
 			voteChan <- voteReply
@@ -455,14 +469,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.setCurrentTerm(args.Term)
 		rf.setRaftState(Follower)
-		rf.setVotedFor(None)
+		rf.setVotedFor(None) // come to new term clear votedFor
 	}
 
+	// we solve this issue by spilt heartbeat and logReplication
 	// we update lastContact after term-judging instead of when AppendEntries
 	// succeed to prevent the issue caused by unexpected election since it will
 	// take many AppendEntries to sync amount of conflict log in
 	// "Test (2B): leader backs up quickly over incorrect follower logs"
-	rf.setLastContact()
+	//rf.setLastContact()
 
 	// check log
 	if args.PrevLogIndex > 0 {
@@ -533,6 +548,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.setLastLog(last.Index, last.Term)
 		}
 	}
+
 	// check commit
 	if args.LeaderCommit > 0 && args.LeaderCommit > rf.getCommitIndex() {
 		index := min(args.LeaderCommit, rf.LastIndex())
@@ -541,12 +557,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	//rf.setLastContact()
+	rf.setLastContact()
 }
 
-// LeaderReplication is goroutine that copy logEntry from Leader to Follower
+// long run routine to send heartbeat
+func (rf *Raft) heartBeat(raftId int, stopCh chan struct{}) {
+	var fails uint32
+	hbReq := &AppendEntriesArgs{
+		Term:     rf.getCurrentTerm(),
+		LeaderId: rf.me,
+	}
+
+	hbReply := new(AppendEntriesReply)
+	for {
+		select {
+		case <-randomTimeout(HeartBeatTimeout / 4):
+		case <-stopCh:
+			return
+		}
+		if ok := rf.peers[raftId].Call("Raft.AppendEntries", hbReq, hbReply); !ok {
+			DPrintf("[term %d]: Raft[%d] failed to heartBeat to Raft[%d]", rf.getCurrentTerm(), rf.me, raftId)
+			nextRetry := calculateRetryTime(10*time.Microsecond, fails, 10, HeartBeatTimeout/2)
+			fails++
+			select {
+			case <-time.After(nextRetry):
+			case <-stopCh:
+				return
+			}
+		} else {
+			rf.setLastContact()
+			fails = 0
+		}
+	}
+}
+
+// LeaderReplicateTo is goroutine that copy logEntry from Leader to one Follower
 // leaderStepDownCh are used to notify Leader to stepDown when new term are discovered,
-func (rf *Raft) LeaderReplication(raftId int, leaderStepDownCh chan struct{}) {
+func (rf *Raft) LeaderReplicateTo(raftId int, leaderStepDownCh chan struct{}, stopCh chan struct{}) {
 	rf.LeaderLock.Lock()
 	if rf.getRaftState() != Leader { // we are facing some issue that Leader step down after the replication started
 		return
@@ -555,6 +602,7 @@ func (rf *Raft) LeaderReplication(raftId int, leaderStepDownCh chan struct{}) {
 	rf.LeaderLock.Unlock()
 	lastLogIndex, _ := rf.getLastLog()
 
+SendLog:
 	// setup args for appendEntries
 	args := new(AppendEntriesArgs)
 	args.Term = rf.getCurrentTerm()
@@ -618,6 +666,20 @@ func (rf *Raft) LeaderReplication(raftId int, leaderStepDownCh chan struct{}) {
 	}
 	rf.LeaderLock.Unlock()
 
+	select {
+	case <-stopCh:
+		return
+	default:
+	}
+	// check if we should continue sending log to help Follower quickly catch up
+	rf.LeaderLock.Lock()
+	nextIndex = rf.nextIndexes[raftId]
+	rf.LeaderLock.Unlock()
+	if nextIndex <= lastLogIndex {
+		goto SendLog
+	}
+	return
+
 	// send snapshot
 }
 
@@ -648,6 +710,18 @@ func (rf *Raft) leaderCommit() {
 	if shouldCommit {
 		rf.applyLogs(rf.getCommitIndex())
 	}
+}
+
+// LeaderReplication handy start replication to each follower
+func (rf *Raft) LeaderReplication(stopCh chan struct{}) {
+	for id := 0; id < len(rf.peers); id++ {
+		if id == rf.me {
+			continue
+		}
+		go rf.LeaderReplicateTo(id, rf.leaderStepDownCh, stopCh)
+	}
+	// try to commit log after log replication
+	rf.leaderCommit() // another type of timing trigger XD
 }
 
 func (rf *Raft) runCandidate() {
@@ -692,15 +766,15 @@ func (rf *Raft) runCandidate() {
 
 func (rf *Raft) runFollower() {
 	DPrintf("[term %d]: Raft[%d] enter Follower state", rf.getCurrentTerm(), rf.me)
-	heartbeatTimer := randomTimeout(ElectionTimeout)
+	heartbeatTimer := randomTimeout(HeartBeatTimeout)
 
 	for rf.getRaftState() == Follower {
 		select {
 		case <-heartbeatTimer:
-			heartbeatTimer = randomTimeout(ElectionTimeout)
+			heartbeatTimer = randomTimeout(HeartBeatTimeout)
 			// if any success contact happened in HeartBeatTimeout
 			lastContact := rf.getLastContact()
-			if time.Since(lastContact) < ElectionTimeout {
+			if time.Since(lastContact) < HeartBeatTimeout {
 				continue
 			}
 			// Heartbeat failed! Become Candidate
@@ -717,34 +791,40 @@ func (rf *Raft) runFollower() {
 func (rf *Raft) runLeader() {
 	DPrintf("[term %d]: Raft[%d] enter Leader state", rf.getCurrentTerm(), rf.me)
 
+	// we heartbeat to each Raft Node in goroutine instead of from main leader loop
+	stopChan := make(chan struct{}, 1)
+	for id := 0; id < len(rf.peers); id++ {
+		if id == rf.me {
+			continue
+		}
+		go rf.heartBeat(id, stopChan)
+	}
+
 	rf.InitLeaderState()
 
 	defer func() { // use to do clean job after leader step down
 		rf.setLastContact()
+		close(stopChan)
 
 		rf.matchIndexes = nil
 		rf.nextIndexes = nil
+		rf.logTriggerCh = nil
+		rf.leaderStepDownCh = nil
 	}()
 
-	heartBeatTimer := time.After(0) // we start AppendEntries just after we become Leader
+	commitTimer := time.After(CommitTimeout)
 
 	for rf.getRaftState() == Leader {
 		select {
 		case <-rf.leaderStepDownCh:
 			rf.setRaftState(Follower)
 			return
-		case <-heartBeatTimer:
-			heartBeatTimer = time.After(HeartBeatTimeout)
+		case <-rf.logTriggerCh:
+			rf.LeaderReplication(stopChan)
+		case <-commitTimer:
+			commitTimer = time.After(CommitTimeout)
 			rf.setLastContact()
-			// send AppendEntries either for heartbeat or log replication
-			for id := 0; id < len(rf.peers); id++ {
-				if id == rf.me {
-					continue
-				}
-				go rf.LeaderReplication(id, rf.leaderStepDownCh)
-			}
-			// try to commit log after log replication
-			rf.leaderCommit() // another type of timing trigger XD
+			rf.LeaderReplication(stopChan)
 		case <-rf.shutdownCh:
 			return
 		}
@@ -851,6 +931,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		DPrintf("[term %d]: Raft[%d] failed to set log:%v", rf.getCurrentTerm(), rf.me, err)
 	}
 	rf.setLastLog(log.Index, log.Term)
+	asyncNotifyCh(rf.logTriggerCh)
 
 	return index, term, isLeader
 }
@@ -914,8 +995,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.setCommitIndex(0)
 
 	rf.applyCh = applyCh
-	rf.shutdownCh = make(chan struct{}, 10)
-	rf.leaderStepDownCh = make(chan struct{}, 10)
+	rf.shutdownCh = make(chan struct{}, 1)
 	rf.logEntries = newLogStore()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

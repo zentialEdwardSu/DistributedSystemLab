@@ -5,9 +5,8 @@ type AppendEntriesArgs struct {
 	Term     int // Leader's term
 	LeaderId int // Leader's index in peers (Leader.me)
 
-	// these two parameter are used to find the consistencies LogEntry between Leader and Follower
-	PrevLogIndex int // Index of the LogEntry before the LogEntry Leader going to replicate
-	PrevLogTerm  int // term of prevLogIndex
+	PrevLogIndex int // Index of the LogEntry before the one Leader going to replicate
+	PrevLogTerm  int // term of the log at prevLogIndex
 
 	Entries []*LogEntry // LogEntry to be replicated
 
@@ -30,10 +29,16 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // Term of Candidate's last log
 }
 
-// RequestVoteArgsFromRaft generate RequestVoteArgs from Raft state
+type RequestVoteReply struct {
+	VoterId     int  // who give the vote
+	Term        int  // Follower's current term
+	VoteGranted bool // if Candidate receive the vote
+}
+
+// !!Deprecated RequestVoteArgsFromRaft generate RequestVoteArgs from Raft state
 func RequestVoteArgsFromRaft(rf *Raft) RequestVoteArgs {
 
-	lastLogIndex, lastLogTerm := rf.LastEntry()
+	lastLogIndex, lastLogTerm := rf.getLastEntry()
 
 	return RequestVoteArgs{
 		Term:         rf.getCurrentTerm(),
@@ -41,10 +46,4 @@ func RequestVoteArgsFromRaft(rf *Raft) RequestVoteArgs {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-}
-
-type RequestVoteReply struct {
-	VoterId     int  // who give the vote
-	Term        int  // Follower's current term
-	VoteGranted bool // if Candidate receive the vote
 }

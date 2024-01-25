@@ -34,7 +34,7 @@ func min(a, b int) int {
 	return b
 }
 
-// // toMilliseconds convert int timeout to duration
+// toMilliseconds convert int timeout to duration
 func toMilliseconds(t int) time.Duration {
 	return time.Millisecond * time.Duration(t)
 }
@@ -48,6 +48,15 @@ func randomTimeout(minVal time.Duration) <-chan time.Time {
 	return time.After(minVal + extra)
 }
 
+// asyncNotifyCh is used to do an async channel send
+// to a single channel without blocking.
+func asyncNotifyCh(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
 // when get nil while load, return 0
 func parseAtomicValueInt(atom atomic.Value) int {
 	if val := atom.Load(); val == nil {
@@ -55,6 +64,18 @@ func parseAtomicValueInt(atom atomic.Value) int {
 	} else {
 		return val.(int)
 	}
+}
+
+func calculateRetryTime(base time.Duration, fails uint32, maxFails uint32, timeLimit time.Duration) time.Duration {
+	if fails > maxFails {
+		return timeLimit
+	}
+
+	retryTime := base * time.Duration(1<<fails)
+	if retryTime > timeLimit {
+		return timeLimit
+	}
+	return retryTime
 }
 
 func BuddhaBless(b bool) {

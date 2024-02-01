@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -14,15 +15,15 @@ type LogEntry struct {
 	Command interface{} // generic Command to hold log command
 }
 
-func (l *LogEntry) String() string {
-	return fmt.Sprintf("{term:%d,index:%d,Command:%v}", l.Term, l.Index, l.Command)
+func (l LogEntry) String() string {
+	return fmt.Sprintf("{index:%d,term:%d,Command:%v}", l.Index, l.Term, l.Command)
 }
 
 // LogStore inspired by https://github.com/hashicorp/raft/blob/main/inmem_store.go
 // we chose map instead of slice to hold log data to gain o(1) LogSearching and LogInserting
 type LogStore struct {
 	l         sync.RWMutex
-	logs      map[int]*LogEntry // logEntries
+	logs      map[int]LogEntry // logEntries
 	lowIndex  int
 	highIndex int
 }
@@ -39,11 +40,11 @@ func (ls *LogStore) getLog(idx int, l *LogEntry) error {
 	if !ok {
 		return ErrLogNotFound
 	}
-	*l = *log
+	*l = log
 	return nil
 }
 
-func (ls *LogStore) setLogs(logs []*LogEntry) error {
+func (ls *LogStore) setLogs(logs []LogEntry) error {
 	ls.l.Lock()
 	defer ls.l.Unlock()
 
@@ -58,18 +59,36 @@ func (ls *LogStore) setLogs(logs []*LogEntry) error {
 		}
 	}
 
-	//DPrintf("LogStore:%v", ls.logs)
-
 	return nil
 }
 
-func (ls *LogStore) setLog(log *LogEntry) error {
-	return ls.setLogs([]*LogEntry{log})
+func (ls *LogStore) setLog(log LogEntry) error {
+	return ls.setLogs([]LogEntry{log})
+}
+
+func (ls *LogStore) unwrapLogs() []LogEntry {
+	r := make([]LogEntry, 0)
+	ls.l.RLock()
+
+	// Since map is unordered, we must get the keys and sort them
+	// to make sure the slice we get by key is ordered
+	keys := make([]int, 0, len(ls.logs))
+	for k := range ls.logs {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+
+	for _, k := range keys {
+		r = append(r, ls.logs[k])
+	}
+	ls.l.RUnlock()
+
+	return r
 }
 
 func newLogStore() *LogStore {
 	l := new(LogStore)
-	l.logs = make(map[int]*LogEntry)
+	l.logs = make(map[int]LogEntry)
 	return l
 }
 

@@ -9,9 +9,10 @@ import (
 )
 
 // Debugging
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
+	log.SetFlags(log.Lmicroseconds)
 	if Debug {
 		log.Printf(format, a...)
 	}
@@ -104,3 +105,9 @@ func BuddhaBless(b bool) {
 		fmt.Println("菩提本无树 \t明镜亦非台 \n 本来无BUG \t 何必常修改")
 	}
 }
+
+type intSlice4Sort []int
+
+func (p intSlice4Sort) Len() int           { return len(p) }
+func (p intSlice4Sort) Less(i, j int) bool { return p[i] < p[j] }
+func (p intSlice4Sort) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }

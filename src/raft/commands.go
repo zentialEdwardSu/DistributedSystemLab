@@ -8,7 +8,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int // Index of the LogEntry before the one Leader going to replicate
 	PrevLogTerm  int // term of the log at prevLogIndex
 
-	Entries []*LogEntry // LogEntry to be replicated
+	Entries []LogEntry // LogEntry to be replicated
 
 	LeaderCommit int // Leader Commit Index
 }

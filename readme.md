@@ -7,8 +7,8 @@ my implement for Lab of [MIT 6.5840](https://pdos.csail.mit.edu/6.824/)
 - [ ] Lab2
     - [X] Lab2A 
     - [X] Lab2B 
-    - [ ] Lab2C (working on)
-    - [ ] Lab2D
+    - [X] Lab2C
+    - [ ] Lab2D(working on)
 - [ ] Lab3
 - [ ] Lab4
 
@@ -18,7 +18,9 @@ my implement for Lab of [MIT 6.5840](https://pdos.csail.mit.edu/6.824/)
 - [MapReduce: Simplified Data Processing on Large Clusters](https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/)
 - [raft page](https://raft.github.io/)
 - [In Search of an Understandable Consensus Algorithm (Extended Version)](https://raft.github.io/raft.pdf)
+- [Consensus: Bridging Theory and Practice](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
 - [Hashicorp Raft](https://github.com/hashicorp/raft)
+- [ectd raft](https://etcd.io/)
 - [cmap](https://github.com/lrita/cmap)
 
 ## Test result
@@ -68,6 +70,8 @@ PASS
 ok      6.5840/raft     35.238s
 go test -run 2B -race  2.04s user 1.50s system 9% cpu 37.554 total
 ```
+
+### 2C
 
 ```bash
 Test (2C): basic persistence ...

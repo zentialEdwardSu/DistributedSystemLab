@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -9,7 +10,20 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
+
+const (
+	MeasureLastAppendEntriesSuccess = false
+	FastCatchUp                     = true
+	PreVote                         = false
+	CheckQuorum                     = false
+	BatchStart                      = false
+)
+
+var (
+	ErrRaftShutdown = errors.New("raft is already shutdown")
+	ErrNotLeader    = errors.New("raft is not Leader")
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	log.SetFlags(log.Lmicroseconds)
@@ -67,6 +81,29 @@ func parseAtomicValueInt(atom atomic.Value) int {
 	}
 }
 
+type intSlice4Sort []int
+
+func (p intSlice4Sort) Len() int           { return len(p) }
+func (p intSlice4Sort) Less(i, j int) bool { return p[i] < p[j] }
+func (p intSlice4Sort) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+
+type State uint32
+
+func (s State) String() string {
+	switch s {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Shutdown:
+		return "Shutdown"
+	default:
+		return "UnKnown"
+	}
+}
+
 func calculateRetryTime(base time.Duration, fails uint32, maxFails uint32, timeLimit time.Duration) time.Duration {
 	if fails > maxFails {
 		return timeLimit
@@ -105,9 +142,3 @@ func BuddhaBless(b bool) {
 		fmt.Println("菩提本无树 \t明镜亦非台 \n 本来无BUG \t 何必常修改")
 	}
 }
-
-type intSlice4Sort []int
-
-func (p intSlice4Sort) Len() int           { return len(p) }
-func (p intSlice4Sort) Less(i, j int) bool { return p[i] < p[j] }
-func (p intSlice4Sort) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }

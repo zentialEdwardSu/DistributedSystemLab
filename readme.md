@@ -14,7 +14,7 @@ my implement for Lab of [MIT 6.5840](https://pdos.csail.mit.edu/6.824/)
 
 ## Citation
 - [6.5840 course page](https://pdos.csail.mit.edu/6.824/index.html)
-- 6.5840 labCode: git://g.csail.mit.edu/6.5840-golabs-2024 6.5840
+- 6.5840 labCode: git://g.csail.mit.edu/6.5840-golabs-2023 6.5840
 - [MapReduce: Simplified Data Processing on Large Clusters](https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/)
 - [raft page](https://raft.github.io/)
 - [In Search of an Understandable Consensus Algorithm (Extended Version)](https://raft.github.io/raft.pdf)
@@ -45,26 +45,48 @@ go test -run 2A  0.37s user 0.27s system 4% cpu 13.716 total
 
 ```bash
 Test (2B): basic agreement ...
-  ... Passed --   0.8  3   21    5769    3
+  ... Passed --   0.4  3   19    5674    3
 Test (2B): RPC byte count ...
-  ... Passed --   2.0  3   76  121624   11
+  ... Passed --   0.9  3   68  131264   11
 Test (2B): test progressive failure of followers ...
-  ... Passed --   4.7  3  145   31543    3
+  ... Passed --   4.4  3  122   27212    3
 Test (2B): test failure of leaders ...
-  ... Passed --   5.3  3  208   48338    3
+  ... Passed --   4.5  3  138   32989    3
 Test (2B): agreement after follower reconnects ...
-  ... Passed --   4.2  3  125   32608    7
+  ... Passed --   5.0  3  170   48394    8
 Test (2B): no agreement if too many followers disconnect ...
-  ... Passed --   3.6  5  244   51180    3
+  ... Passed --   3.3  5  240   51695    4
 Test (2B): concurrent Start()s ...
-  ... Passed --   0.7  3   23    6649    6
+  ... Passed --   0.6  3   20    6184    6
 Test (2B): rejoin of partitioned leader ...
-  ... Passed --   6.2  3  218   56948    4
+  ... Passed --   3.6  3  123   32874    4
 Test (2B): leader backs up quickly over incorrect follower logs ...
-  ... Passed --  22.0  5 3952 4127397  102
-Test (2B): RPC counts aren't too high ...
-  ... Passed --   2.1  3   58   16642   12
+  ... Passed --  10.4  5 2184 2306499  102
+Test (2B): RPC counts arent too high ...
+  ... Passed --   2.1  3   72   22490   12
 PASS
-ok      6.5840/raft     51.616s
-go test -run 2B  1.08s user 0.53s system 3% cpu 51.881 total
+ok      6.5840/raft     35.238s
+go test -run 2B -race  2.04s user 1.50s system 9% cpu 37.554 total
+```
+
+```bash
+Test (2C): basic persistence ...
+  ... Passed --   2.9  3   94   26695    6
+Test (2C): more persistence ...
+  ... Passed --  14.0  5  985  234116   16
+Test (2C): partitioned leader and one follower crash, leader restarts ...
+  ... Passed --   1.2  3   43   11716    4
+Test (2C): Figure 8 ...
+  ... Passed --  29.5  5 1415  342308   69
+Test (2C): unreliable agreement ...
+  ... Passed --   3.5  5  956  722911  246
+Test (2C): Figure 8 (unreliable) ...
+  ... Passed --  39.7  5 17535 63457933   83
+Test (2C): churn ...
+  ... Passed --  16.1  5 6052 17276044  527
+Test (2C): unreliable churn ...
+  ... Passed --  16.3  5 7539 26118515  509
+PASS
+ok      6.5840/raft     123.459s
+go test -run 2C -race  48.03s user 3.50s system 41% cpu 2:03.81 total
 ```

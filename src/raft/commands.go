@@ -2,29 +2,26 @@ package raft
 
 // AppendEntriesArgs is Args for AppendEntriesRPC
 type AppendEntriesArgs struct {
-	Term     int // Leader's term
-	LeaderId int // Leader's index in peers (Leader.me)
-
-	PrevLogIndex int // Index of the LogEntry before the one Leader going to replicate
-	PrevLogTerm  int // term of the log at prevLogIndex
-
-	Entries []LogEntry // LogEntry to be replicated
-
-	LeaderCommit int // Leader Commit Index
+	Term         int        // Leader's term
+	LeaderId     int        // Leader's index in peers (Leader.me)
+	PrevLogIndex int        // Index of the LogEntry before the one Leader going to replicate
+	PrevLogTerm  int        // term of the log at prevLogIndex
+	Entries      []LogEntry // LogEntry to be replicated
+	LeaderCommit int        // Leader Commit Index
 }
 
 type AppendEntriesReply struct {
-	Term int // Follower's current term (for Leader to update itself)
-
+	Term    int  // Follower's current term (for Leader to update itself)
 	Success bool // if AppendEntries Request had succeed
-
-	LastLog int // last log help leader quick find conflict and check if Leader and Follower are in consist
+	LastLog int  // last log help leader quick find conflict and check if Leader and Follower are in consist
+	//AccelerateValid bool // should we do FastCatchUp process
+	ConflictIndex int // the first index it stores for conflicting entry's term
+	ConflictTerm  int // the term of the conflicting entry
 }
 
 type RequestVoteArgs struct {
-	Term        int // Candidate term
-	CandidateId int // Candidate Index in peers
-
+	Term         int // Candidate term
+	CandidateId  int // Candidate Index in peers
 	LastLogIndex int // Index of Candidate's last log
 	LastLogTerm  int // Term of Candidate's last log
 }
@@ -36,14 +33,14 @@ type RequestVoteReply struct {
 }
 
 // !!Deprecated RequestVoteArgsFromRaft generate RequestVoteArgs from Raft state
-func RequestVoteArgsFromRaft(rf *Raft) RequestVoteArgs {
-
-	lastLogIndex, lastLogTerm := rf.getLastEntry()
-
-	return RequestVoteArgs{
-		Term:         rf.getCurrentTerm(),
-		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	}
-}
+//func RequestVoteArgsFromRaft(rf *Raft) RequestVoteArgs {
+//
+//	lastLogIndex, lastLogTerm := rf.getLastEntry()
+//
+//	return RequestVoteArgs{
+//		Term:         rf.getCurrentTerm(),
+//		CandidateId:  rf.me,
+//		LastLogIndex: lastLogIndex,
+//		LastLogTerm:  lastLogTerm,
+//	}
+//}

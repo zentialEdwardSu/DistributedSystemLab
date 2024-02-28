@@ -8,6 +8,7 @@ import (
 )
 
 var ErrLogNotFound = errors.New("log not found")
+var ErrNoLogTerm = errors.New("no log with given term found")
 
 type LogEntry struct {
 	Term    int         // Term when the log entries create
@@ -66,6 +67,7 @@ func (ls *LogStore) setLog(log LogEntry) error {
 	return ls.setLogs([]LogEntry{log})
 }
 
+// return Index-ordered SLice that hold logStore's log
 func (ls *LogStore) unwrapLogs() []LogEntry {
 	r := make([]LogEntry, 0)
 	ls.l.RLock()
@@ -121,4 +123,39 @@ func (ls *LogStore) LastIndex() (int, error) {
 	ls.l.RLock()
 	defer ls.l.RUnlock()
 	return ls.highIndex, nil
+}
+
+func (ls *LogStore) Length() (l int) {
+	ls.l.RLock()
+	defer ls.l.RUnlock()
+	l = len(ls.logs)
+	return
+}
+
+// LogTermRange will find the first index and last index of log which have given term
+func (ls *LogStore) LogTermRange(term int) (first, last int, err error) {
+	ls.l.RLock()
+	defer ls.l.RUnlock()
+
+	if term < 1 {
+		return 0, 0, ErrNoLogTerm
+	}
+
+	for first = 0; first < ls.highIndex; first++ {
+		if ls.logs[first].Term == term {
+			break
+		}
+	}
+
+	for last = ls.highIndex; last > ls.lowIndex; last-- {
+		if ls.logs[last].Term == term {
+			break
+		}
+	}
+
+	if first <= last {
+		return
+	}
+
+	return 0, 0, ErrNoLogTerm
 }

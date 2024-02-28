@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -32,44 +33,30 @@ import (
 	"6.5840/labrpc"
 )
 
-type State uint32
-
 const (
 	Follower State = iota
 	Candidate
 	Leader
 	Shutdown
+	PreCandidate // for PreVote
 )
-
-func (r State) String() string {
-	switch r {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	case Shutdown:
-		return "Shutdown"
-	default:
-		return "UnKnown"
-	}
-}
 
 const (
 	ElectionTimeout = 200 * time.Millisecond // limit of Timeout for election and re-election
 
-	HeartBeatTimeout = 300 * time.Millisecond // Timeout when Follower didn't contact with a Leader
+	HeartBeatTimeout = 150 * time.Millisecond // Timeout when Follower didn't contact with a Leader
 
 	// ReplicationTimeout for we spilt heartbeat and logReplication we need a timeout to trigger LogReplication
 	// when no Start() called
-	ReplicationTimeout = 100 * time.Millisecond
+	ReplicationTimeout = 300 * time.Millisecond
 
-	RPCTimeout = 100 * time.Millisecond // timeout for an RPC call
+	RPCTimeout = 100 * time.Millisecond // **Deprecated** timeout for an RPC call
+
+	BatchStartTimeout = ReplicationTimeout / 5
 )
 
 const (
-	MaxBufferCh = 200
+	MaxAppendEntries = 300
 )
 
 const None = -1
@@ -122,6 +109,7 @@ type Raft struct {
 	commitIndex      atomic.Value // index of highest logEntry committed
 
 	LeaderLock       sync.Mutex
+	stepDown         bool          // if the leader stepped down
 	leaderStartIndex int           // the first index Leader will use
 	nextIndexes      map[int]int   // next index Leader will send to each follower
 	matchIndexes     map[int]int   // index of highest log entry known to be replicated
@@ -143,7 +131,10 @@ type Raft struct {
 	lastContact      time.Time // last contact with Leader
 	lastContactRLock sync.RWMutex
 
-	startLock sync.Mutex
+	startCh chan *LogFuture // receive command from client via Start()
+
+	// measure if fast catchup works
+	LastSuccess time.Time
 }
 
 func (rf *Raft) String() string {
@@ -170,8 +161,8 @@ func (rf *Raft) getLastContact() (last time.Time) {
 }
 
 func (rf *Raft) setLastContact() {
-	rf.lastContactRLock.RLock()
-	defer rf.lastContactRLock.RUnlock()
+	rf.lastContactRLock.Lock()
+	defer rf.lastContactRLock.Unlock()
 
 	rf.lastContact = time.Now()
 	return
@@ -273,8 +264,8 @@ func (rf *Raft) getLastEntry() (index, term int) {
 func (rf *Raft) InitLeaderState() {
 	rf.LeaderLock.Lock()
 	defer rf.LeaderLock.Unlock()
-	rf.matchIndexes = make(map[int]int, len(rf.peers)-1)
-	rf.nextIndexes = make(map[int]int, len(rf.peers)-1)
+	rf.matchIndexes = make(map[int]int)
+	rf.nextIndexes = make(map[int]int)
 	rf.logTriggerCh = make(chan struct{}, 1)
 	rf.leaderStepDownCh = make(chan struct{}, 1)
 	lastIndex, _ := rf.getLastLog()
@@ -300,7 +291,7 @@ func (rf *Raft) GetState() (term int, isLeader bool) {
 }
 
 // vote needed
-func (rf *Raft) majoritySize() (majority int) {
+func (rf *Raft) QuorumSize() (majority int) {
 	majority = len(rf.peers)/2 + 1
 	return
 }
@@ -328,7 +319,6 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	raftState := w.Bytes()
 	rf.persister.Save(raftState, nil)
-	//fmt.Println(time.Since(start))
 }
 
 // restore previously persisted state.
@@ -385,8 +375,7 @@ func (rf *Raft) readPersist(data []byte) {
 		lastLog := logs[logLen-1]
 		rf.setLastLog(lastLog.Index, lastLog.Term)
 	}
-	DPrintf("[term %d]: Raft[%d] recover succeed State: %v", rf.getCurrentTerm(), rf.me, rf)
-
+	//DPrintf("[term %d]: Raft[%d] recover succeed State: %v", rf.getCurrentTerm(), rf.me, rf)
 }
 
 // the service says it has created a snapshot that has
@@ -502,7 +491,7 @@ func (rf *Raft) electSelf() <-chan *RequestVoteReply {
 			voteReply := new(RequestVoteReply)
 			ok := rf.sendRequestVote(pidx, voteRequest, voteReply)
 			if !ok {
-				DPrintf("[term %d]: Raft[%d] failed to requestVote from Raft[%d]", rf.getCurrentTerm(), rf.me, pidx)
+				//DPrintf("[term %d]: Raft[%d] failed to requestVote from Raft[%d]", rf.getCurrentTerm(), rf.me, pidx)
 			}
 			voteChan <- voteReply
 		}(idx)
@@ -515,6 +504,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 	reply.LastLog, _ = rf.getLastLog()
 	reply.Term = rf.getCurrentTerm()
+	defer func() {
+		rf.lastLock.Lock()
+		defer rf.lastLock.Unlock()
+		if reply.Success {
+			rf.LastSuccess = time.Now()
+		}
+		if MeasureLastAppendEntriesSuccess {
+			DPrintf("[term %d]: Raft[%d] %v since last success AppendEntries", rf.getCurrentTerm(), rf.me, time.Since(rf.LastSuccess))
+		}
+	}()
 
 	// Ignore an older term
 	if args.Term < rf.getCurrentTerm() {
@@ -534,25 +533,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// check log
 	if args.PrevLogIndex > 0 {
 		lastIndex, lastTerm := rf.getLastLog()
-
-		//DPrintf("[term %d]: Raft[%d] lastIndex:%d Term:%d, Args.prevIndex:%d %d", rf.getCurrentTerm(), rf.me, lastIndex, lastTerm, args.PrevLogIndex, args.PrevLogTerm)
-
 		var prevLogTerm int
 		if args.PrevLogIndex == lastIndex {
 			prevLogTerm = lastTerm // leader and follower's log are match
 		} else {
 			prevLog := new(LogEntry)
 			if err := rf.logEntries.getLog(args.PrevLogIndex, prevLog); err != nil {
-				DPrintf("[term %d]: Raft[%d] in PrevLog %v,lastLog %v :%v",
-					rf.getCurrentTerm(), rf.me, args.PrevLogIndex, lastIndex, err)
+				if errors.Is(err, ErrLogNotFound) && FastCatchUp { // Case 3
+					reply.ConflictIndex = max(rf.logEntries.Length(), 1) // conflictIndex = len(log)
+					reply.ConflictTerm = None                            // conflictTerm = None
+					DPrintf("[term %d]: Raft[%d] ConflictIndex set to log length: %d Term %d(None)", rf.getCurrentTerm(), rf.me, reply.ConflictIndex, reply.ConflictTerm)
+				} else {
+					DPrintf("[term %d]: Raft[%d] in args.PrevLog %d:%v", rf.getCurrentTerm(), rf.me, args.PrevLogIndex, err)
+				}
 				return
 			}
 			prevLogTerm = prevLog.Term
 		}
 
 		if args.PrevLogTerm != prevLogTerm {
-			DPrintf("[term %d]: Raft[%d] log term mis-match Local:%v Remote %v",
-				rf.getCurrentTerm(), rf.me, prevLogTerm, args.PrevLogTerm)
+			DPrintf("[term %d]: Raft[%d] log term mis-match Local:%v Remote %v", rf.getCurrentTerm(), rf.me, prevLogTerm, args.PrevLogTerm)
+			if FastCatchUp {
+				reply.ConflictTerm = prevLogTerm // log[PrevLogIndex].Term
+				ConflictIndex, _, _ := rf.logEntries.LogTermRange(prevLogTerm)
+				reply.ConflictIndex = ConflictIndex + 1 // the first index whose entry has term equal to conflictTerm
+				//reply.AccelerateValid = true
+				DPrintf("[term %d]: Raft[%d] ConflictIndex %d Term %d", rf.getCurrentTerm(), rf.me, reply.ConflictIndex, reply.ConflictTerm)
+			}
 			return
 		}
 	}
@@ -570,15 +577,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			ilog := new(LogEntry)
 			if err := rf.logEntries.getLog(log.Index, ilog); err != nil {
-				DPrintf("[term %d]: Raft[%d] fail to get log in %v: %v",
+				DPrintf("[term %d]: Raft[%d] when trying to pass duplicate log, fail to get log in %v: %v",
 					rf.getCurrentTerm(), rf.me, log.Index, err)
 				return
 			}
 
-			if log.Term != ilog.Term { // conflict happened clear any log after ilog.Index in rf.logEntries
+			if log.Term != ilog.Term { // conflict Arrived clear any log after ilog.Index in rf.logEntries
 				DPrintf("[term %d]: Raft[%d] try to delete conflicting log [%d %d]",
 					rf.getCurrentTerm(), rf.me, log.Index, lastlog)
-
 				if err := rf.logEntries.DeleteRange(log.Index, lastlog); err != nil {
 					DPrintf("[term %d]: Raft[%d] fail to delete log in : %v",
 						rf.getCurrentTerm(), rf.me, err)
@@ -606,7 +612,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > 0 && args.LeaderCommit > rf.getCommitIndex() {
 		index := min(args.LeaderCommit, rf.LastIndex())
 		rf.setCommitIndex(index)
-		rf.applyLogs() // apply committed log to services
+		//rf.applyLogs() // apply committed log to services Su: Followers apply should also via applyRoutine
 	}
 
 	reply.Success = true
@@ -614,7 +620,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 // long run routine to send heartbeat
-func (rf *Raft) heartBeat(raftId int, stopCh chan struct{}) {
+func (rf *Raft) heartBeat(to int, stopCh chan struct{}) {
 	//var fails uint32
 	hbReq := &AppendEntriesArgs{
 		Term:     rf.getCurrentTerm(),
@@ -628,8 +634,8 @@ func (rf *Raft) heartBeat(raftId int, stopCh chan struct{}) {
 		case <-stopCh:
 			return
 		}
-		if ok := rf.peers[raftId].Call("Raft.AppendEntries", hbReq, hbReply); !ok {
-			DPrintf("[term %d]: Raft[%d] failed to heartBeat to Raft[%d]", rf.getCurrentTerm(), rf.me, raftId)
+		if ok := rf.peers[to].Call("Raft.AppendEntries", hbReq, hbReply); !ok {
+			DPrintf("[term %d]: Raft[%d] failed to heartBeat to Raft[%d]", rf.getCurrentTerm(), rf.me, to)
 			//nextRetry := calculateRetryTime(10*time.Microsecond, fails, 10, HeartBeatTimeout/2)
 			//fails++
 			//select {
@@ -654,9 +660,9 @@ func (rf *Raft) LeaderReplicateTo(raftId int, leaderStepDownCh chan struct{}, st
 	}
 	nextIndex := rf.nextIndexes[raftId]
 	rf.LeaderLock.Unlock()
+SendLog:
 	lastLogIndex, _ := rf.getLastLog()
 
-SendLog:
 	// setup args for appendEntries
 	args := new(AppendEntriesArgs)
 	args.Term = rf.getCurrentTerm()
@@ -668,22 +674,21 @@ SendLog:
 		args.PrevLogIndex = 0
 		args.PrevLogTerm = 0
 	} else {
-		var l LogEntry
-		err := rf.logEntries.getLog(nextIndex-1, &l)
-		if err != nil {
-			DPrintf("Raft[%v] failed to get log at %d: %v", rf.me, nextIndex-1, err)
+		l := new(LogEntry)
+		if err := rf.logEntries.getLog(nextIndex-1, l); err != nil {
+			DPrintf("Raft[%v] when preparing prevLogX, failed to get log at %d: %v", rf.me, nextIndex-1, err)
 			return
 		}
 		args.PrevLogIndex = l.Index
 		args.PrevLogTerm = l.Term
 	}
 	// append log into args.Entries
-	logLen := min(nextIndex+MaxBufferCh-1, lastLogIndex)
+	logLen := min(nextIndex+MaxAppendEntries-1, lastLogIndex)
 	args.Entries = make([]LogEntry, 0)
 	for i := nextIndex; i <= logLen; i++ {
 		tmpLog := new(LogEntry)
 		if err := rf.logEntries.getLog(i, tmpLog); err != nil {
-			DPrintf("Raft[%v] failed to get log at %d: %v", rf.me, nextIndex-1, err)
+			DPrintf("Raft[%v] when prepare args.logs,failed to get log at %d: %v", rf.me, nextIndex-1, err)
 			return
 		}
 		args.Entries = append(args.Entries, *tmpLog)
@@ -717,9 +722,27 @@ SendLog:
 			rf.leaderCommit()
 		}
 	} else {
-		//update nextIndex: decrease
-		newIndex := max(min(rf.nextIndexes[raftId]-1, reply.LastLog+1), 1)
-		rf.nextIndexes[raftId] = newIndex
+		// when AppendEntries request is rejected by follower ,update nextIndex and resend
+		var newIndex int
+		if FastCatchUp { // we some times need acceleration to pass the test
+			if _, lastIndex, err := rf.logEntries.LogTermRange(reply.ConflictTerm); err != nil {
+				if errors.Is(err, ErrNoLogTerm) {
+					newIndex = reply.ConflictIndex // Case 1,3
+					//DPrintf("for %d no given term %d founded, nextIndex will be %d", raftId, reply.ConflictTerm, newIndex)
+				} else {
+					panic(fmt.Sprintf("[term %d]: Raft[%d] failed while bypass term: %v", rf.getCurrentTerm(), rf.me, err))
+					rf.LeaderLock.Unlock()
+					return
+				}
+			} else {
+				newIndex = lastIndex + 1 //Case 2
+				//DPrintf("for %d, term %d founded, set nextIndex to be one beyond Leader's term last: %d", raftId, reply.ConflictTerm, newIndex)
+			}
+		} else {
+			// simply decrease 1
+			newIndex = min(rf.nextIndexes[raftId]-1, reply.LastLog+1)
+		}
+		rf.nextIndexes[raftId] = max(newIndex, 1) // apply chanages
 	}
 	rf.LeaderLock.Unlock()
 
@@ -738,15 +761,13 @@ SendLog:
 	return
 
 	// send snapshot
+	//SEND_SNAP:
+	//	return
 }
 
 // Call by Leader to update commitIndex after replicate log to peer
 // call with lock held
 func (rf *Raft) leaderCommit() {
-	if len(rf.matchIndexes) < 0 {
-		return
-	}
-
 	t := make([]int, 0)
 	for _, nMatchIndex := range rf.matchIndexes {
 		t = append(t, nMatchIndex)
@@ -756,34 +777,12 @@ func (rf *Raft) leaderCommit() {
 
 	if majorityMatch > rf.getCommitIndex() && majorityMatch >= rf.leaderStartIndex {
 		rf.setCommitIndex(majorityMatch)
+		asyncNotifyCh(rf.logTriggerCh)
 		//DPrintf("[term %d]: Raft[%d] update commit Index %d", rf.getCurrentTerm(), rf.me, majorityMatch)
-		//rf.applyLogs()
 	}
-	//lastLogIndex, _ := rf.getLastLog()
-	//shouldCommit := false
-	//
-	//for i := rf.getCommitIndex() + 1; i <= lastLogIndex; i++ {
-	//	consensusCount := 1 // Leader are consensus
-	//	for _, m := range rf.matchIndexes {
-	//		if m >= i {
-	//			consensusCount += 1
-	//			if consensusCount*2 > len(rf.peers) {
-	//				rf.setCommitIndex(i)
-	//				shouldCommit = true
-	//				break
-	//			}
-	//		}
-	//	}
-	//	if rf.getCommitIndex() != i {
-	//		break
-	//	}
-	//}
-	//
-	//if shouldCommit {
-	//	rf.applyLogs(rf.getCommitIndex())
-	//}
 }
 
+// applyRoutine are used to apply log to fsm regularly
 func (rf *Raft) applyRoutine(shutdownCh chan struct{}) {
 	applyTimer := time.After(ReplicationTimeout / 5)
 	for {
@@ -800,7 +799,11 @@ func (rf *Raft) applyRoutine(shutdownCh chan struct{}) {
 // applyLogs will apply all the committed & not applied log to services(in lab is applyCh)
 // for lab tester's competition log will transmit this way (logs->bufferCh->applyCh)
 func (rf *Raft) applyLogs() {
-
+	// Issue: apply out of order may be caused by too-frequent log applying --
+	// new log is applied before the older apply-helper routine finish,
+	// so we add WaitGroup to make sure only when apply-helper routine return
+	// do we update LastAppliedIndex
+	//wg := sync.WaitGroup{}
 	index := rf.getCommitIndex()
 	lastApplied := rf.getLastApplied()
 	if index <= lastApplied {
@@ -809,18 +812,19 @@ func (rf *Raft) applyLogs() {
 	}
 	// we set a maximum number of submissions at one time to prevent re-election caused by
 	// the Leader trying to apply a large number of msg
-	applyLen := min(index-lastApplied, MaxBufferCh)
-	DPrintf("[term %d]: Raft[%d] prepare to apply until %d, %d will be applied", rf.getCurrentTerm(), rf.me, index, applyLen)
+	targetIndex := min(index, lastApplied+MaxAppendEntries)
+	DPrintf("[term %d]: Raft[%d] current %d prepare to apply until %d", rf.getCurrentTerm(), rf.me, lastApplied, targetIndex)
 
-	bufferCh := make(chan ApplyMsg, applyLen) // chan to hold to-send ApplyMsg
+	// we use buffer channel to prevent possible lock issue
+	bufferCh := make(chan ApplyMsg, targetIndex-lastApplied) // chan to hold to-send ApplyMsg
 	// send log to buffer
-	for idx := lastApplied + 1; idx <= index; idx++ {
+	for idx := lastApplied + 1; idx <= targetIndex; idx++ {
 		log := new(LogEntry)
 		if err := rf.logEntries.getLog(idx, log); err != nil {
 			DPrintf("[term %d]: Raft[%d] error while applyLogs[%v]: %v", rf.getCurrentTerm(), rf.me, idx, err)
 			return
 		}
-		DPrintf("[term %d]: Raft[%d] send %d:%d", rf.getCurrentTerm(), rf.me, idx, log.Command)
+		//DPrintf("[term %d]: Raft[%d] send %d:%d", rf.getCurrentTerm(), rf.me, idx, log.Command)
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      log.Command,
@@ -829,8 +833,11 @@ func (rf *Raft) applyLogs() {
 		bufferCh <- msg
 	}
 
-	// goroutine{buffer->applyCh}
+	rf.setLastApplied(targetIndex)
+	//wg.Add(1)
+	// apply-helper {buffer->applyCh}
 	go func() {
+		//defer wg.Done()
 		sended := make([]int, 0)
 		for {
 			select {
@@ -838,14 +845,13 @@ func (rf *Raft) applyLogs() {
 				sended = append(sended, msg.CommandIndex)
 				rf.applyCh <- msg
 			default:
-				DPrintf("Raft[%d] apply %v to tester", rf.me, sended)
+				DPrintf("Raft[%d] %d Logs are applied in routine. Indexes: %v", rf.me, len(sended), sended)
 				return
 			}
 		}
 	}()
 
-	// update index
-	rf.setLastApplied(rf.getLastApplied() + applyLen)
+	//wg.Wait()
 }
 
 // LeaderReplication handy start replication to each follower
@@ -856,7 +862,6 @@ func (rf *Raft) LeaderReplication(stopCh chan struct{}) {
 		}
 		go rf.LeaderReplicateTo(id, rf.leaderStepDownCh, stopCh)
 	}
-	//rf.leaderCommit() // another type of timing trigger XD
 }
 
 func (rf *Raft) runCandidate() {
@@ -869,16 +874,19 @@ func (rf *Raft) runCandidate() {
 
 	voteCh := rf.electSelf()
 
-	voteNeeded := rf.majoritySize()
+	voteNeeded := rf.QuorumSize()
 	votes := 1
 
 	for rf.getRaftState() == Candidate {
 		select {
+		case newLog := <-rf.startCh:
+			newLog.ErrorArrived(ErrNotLeader)
 		case v := <-voteCh:
 			if v.Term > rf.getCurrentTerm() {
 				DPrintf("[term %d]: Raft[%d] New Term discovered %v , fallback to follower", rf.getCurrentTerm(), rf.me, v.Term)
 				rf.setRaftState(Follower)
 				rf.setCurrentTerm(v.Term)
+				rf.persist()
 				return
 			}
 
@@ -906,24 +914,24 @@ func (rf *Raft) runFollower() {
 
 	for rf.getRaftState() == Follower {
 		select {
+		case newLog := <-rf.startCh:
+			newLog.ErrorArrived(ErrNotLeader)
 		case <-heartbeatTimer:
 			heartbeatTimer = randomTimeout(HeartBeatTimeout)
-			// if any success contact happened in HeartBeatTimeout
+			// if any success contact Arrived in HeartBeatTimeout
 			lastContact := rf.getLastContact()
 			if time.Since(lastContact) < HeartBeatTimeout {
 				continue
 			}
 			// Heartbeat failed! Become Candidate
-			DPrintf("[term %d]: Raft[%d] ElectionTimeout! %v", rf.getCurrentTerm(), rf.me, time.Now())
+			DPrintf("[term %d]: Raft[%d] ElectionTimeout!", rf.getCurrentTerm(), rf.me)
 			rf.setRaftState(Candidate)
 			return
 		case <-rf.shutdownCh:
 			return
 		}
 	}
-
 }
-
 func (rf *Raft) runLeader() {
 	DPrintf("[term %d]: Raft[%d] enter Leader state", rf.getCurrentTerm(), rf.me)
 
@@ -935,33 +943,83 @@ func (rf *Raft) runLeader() {
 		}
 		go rf.heartBeat(id, stopChan)
 	}
-
-	go rf.applyRoutine(stopChan)
-
+	//go rf.applyRoutine(stopChan) we start it as the node is created
 	rf.InitLeaderState()
 
 	defer func() { // use to do clean job after leader step down
 		rf.setLastContact()
 		close(stopChan)
 
+		rf.LeaderLock.Lock()
+		defer rf.LeaderLock.Unlock()
 		rf.matchIndexes = nil
 		rf.nextIndexes = nil
 		rf.logTriggerCh = nil
 		rf.leaderStepDownCh = nil
 	}()
 
-	commitTimer := time.After(ReplicationTimeout)
+	replicationTimer := time.After(ReplicationTimeout)
 
 	for rf.getRaftState() == Leader {
 		select {
+		case newLog := <-rf.startCh:
+			batchTimer := time.After(BatchStartTimeout)
+			ready := []*LogFuture{newLog}
+		BATCH_START:
+			for i := 0; i < MaxAppendEntries; i++ {
+				select {
+				case <-batchTimer:
+					break BATCH_START
+				case newLog := <-rf.startCh:
+					ready = append(ready, newLog)
+				default:
+					break BATCH_START
+				}
+			}
+
+			if rf.stepDown {
+				for i := 0; i < len(ready); i++ {
+					ready[i].ErrorArrived(ErrNotLeader)
+				}
+			} else {
+				term := rf.getCurrentTerm()
+				lastIndex := rf.LastIndex()
+
+				n := len(ready)
+				logs := make([]LogEntry, n)
+
+				for idx, newLog := range ready {
+					lastIndex++
+					newLog.log.Index = lastIndex
+					newLog.log.Term = term
+					logs[idx] = newLog.log
+				}
+				fmt.Println(logs)
+
+				if err := rf.logEntries.setLogs(logs); err != nil {
+					DPrintf("[term %d] Raft[%d] failed to set log:%v", term, rf.me, err)
+					for _, l := range ready {
+						l.ErrorArrived(err)
+					}
+					rf.setRaftState(Follower)
+					return
+				}
+				rf.setLastLog(lastIndex, term)
+				for _, l := range ready {
+					fmt.Println(l)
+					l.ErrorArrived(nil)
+				}
+				asyncNotifyCh(rf.logTriggerCh)
+			}
 		case <-rf.leaderStepDownCh:
+			rf.stepDown = true
 			rf.setRaftState(Follower)
 			return
 		case <-rf.logTriggerCh:
 			rf.persist()
 			rf.LeaderReplication(stopChan)
-		case <-commitTimer:
-			commitTimer = time.After(ReplicationTimeout)
+		case <-replicationTimer:
+			replicationTimer = time.After(ReplicationTimeout)
 			rf.setLastContact()
 			rf.LeaderReplication(stopChan)
 		case <-rf.shutdownCh:
@@ -991,6 +1049,27 @@ func (rf *Raft) mainLoop() {
 	}
 }
 
+func (rf *Raft) StartAsync(command interface{}) StartFuture {
+	if rf.getRaftState() != Leader {
+		return WarpedError{ErrNotLeader}
+	}
+
+	logFuture := &LogFuture{
+		log: LogEntry{
+			Command: command,
+		},
+	}
+
+	logFuture.init()
+
+	select {
+	case <-rf.shutdownCh:
+		return WarpedError{ErrRaftShutdown}
+	case rf.startCh <- logFuture:
+		return logFuture
+	}
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -1004,19 +1083,23 @@ func (rf *Raft) mainLoop() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	if BatchStart {
+		DPrintf("StartAsync should be called to submit command when BatchStart is enabled")
+	}
 	index := -1
 	term := rf.getCurrentTerm()
 	isLeader := true
-
-	// Your code here (2B).
-	rf.startLock.Lock()
-	defer rf.startLock.Unlock()
+	//
+	//// Your code here (2B).
 	if rf.getRaftState() != Leader {
 		isLeader = false
 		return index, term, isLeader
 	}
 
-	lastIndex, _ := rf.getLastLog()
+	// We randomly found a lock to ensure the concurrency of Start() XD
+	rf.LeaderLock.Lock()
+	defer rf.LeaderLock.Unlock()
+	lastIndex := rf.LastIndex()
 	index = lastIndex + 1
 
 	log := LogEntry{
@@ -1027,12 +1110,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	err := rf.logEntries.setLog(log)
 	if err != nil {
 		panic(fmt.Sprintf("[term %d]: Raft[%d] failed to set log:%v", rf.getCurrentTerm(), rf.me, err))
-		return index, term, isLeader
+		//return index, term, isLeader
 	}
+
 	rf.setLastLog(log.Index, log.Term)
 	asyncNotifyCh(rf.logTriggerCh)
-	//DPrintf("[term %d]: Raft[%d] get %v", rf.getCurrentTerm(), rf.me, log)
-
+	DPrintf("[term %d]: Raft[%d] get %v", rf.getCurrentTerm(), rf.me, log)
 	return index, term, isLeader
 }
 
@@ -1046,7 +1129,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	rf.shutdownCh <- struct{}{}
+	close(rf.shutdownCh)
 	rf.setRaftState(Shutdown)
 	// Your code here, if desired.
 }
@@ -1080,6 +1163,7 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
+	DPrintf("Raft[%d] started", me)
 	BuddhaBless(false) // we introduce Buddha to give buff to the Node
 
 	rf := &Raft{}
@@ -1100,9 +1184,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	if BatchStart {
+		rf.startCh = make(chan *LogFuture, MaxAppendEntries)
+	} else {
+		rf.startCh = make(chan *LogFuture)
+	}
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.mainLoop()
+	go rf.applyRoutine(rf.shutdownCh)
 
 	return rf
 }
